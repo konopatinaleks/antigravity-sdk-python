@@ -37,6 +37,14 @@ enum AgentBehavior {
   AGENT_BEHAVIOR_INTERACTIVE = 2;
   AGENT_BEHAVIOR_MINIMAL = 3;
 }
+enum ThinkingEffort {
+  THINKING_EFFORT_UNSPECIFIED = 0;
+  THINKING_EFFORT_MINIMAL = 1;
+  THINKING_EFFORT_LOW = 2;
+  THINKING_EFFORT_MEDIUM = 3;
+  THINKING_EFFORT_HIGH = 4;
+  THINKING_EFFORT_MAX = 5;
+}
 enum ModelType {
   MODEL_TYPE_UNSPECIFIED = 0;
   MODEL_TYPE_TEXT = 1;
@@ -73,7 +81,6 @@ message InputConfig {
   string bind_address = 3 [default = "localhost"];
   .antigravity.localharness.ClientInfo client_info = 4;
   map<string, string> env = 5;
-  bool use_interactions_api = 6;
 }
 message InitializeConversationEvent {
   .antigravity.localharness.HarnessConfig config = 1;
@@ -116,6 +123,7 @@ message HarnessConfig {
   .antigravity.localharness.CompactionConfig compaction_config = 24;
   .antigravity.localharness.SkillsConfig skills_config = 27;
   .antigravity.localharness.RulesConfig rules_config = 28;
+  int32 mcp_max_output_bytes = 29;
   extensions 1000 to 1999;
   extensions 2000 to max;
 }
@@ -146,6 +154,7 @@ message FilesystemWorkspace {
 message GeminiModelOptions {
   string thinking_level = 1;
   string service_tier = 2;
+  int32 max_output_tokens = 3;
 }
 message GeminiAPIEndpoint {
   string base_url = 1;
@@ -162,14 +171,14 @@ message VertexEndpoint {
   string api_key = 6;
 }
 message ModelConfig {
+  string name = 1;
+  repeated .antigravity.localharness.ModelType types = 2;
   oneof endpoint {
     .antigravity.localharness.GeminiAPIEndpoint gemini_api_endpoint = 3;
     .antigravity.localharness.VertexEndpoint vertex_endpoint = 4;
     .antigravity.localharness.GemmaEndpoint gemma_endpoint = 6;
     .antigravity.localharness.CustomEndpoint custom_endpoint = 7;
   }
-  string name = 1;
-  repeated .antigravity.localharness.ModelType types = 2;
 }
 message GemmaEndpoint {
   string base_url = 1;
@@ -179,11 +188,18 @@ message CustomEndpoint {
   string config_json = 2;
 }
 message SystemInstructions {
+  enum SectionHeaderFormat {
+    SECTION_HEADER_FORMAT_UNSPECIFIED = 0;
+    SECTION_HEADER_FORMAT_XML = 1;
+    SECTION_HEADER_FORMAT_NONE = 2;
+  }
   oneof type {
     .antigravity.localharness.CustomSystemInstructions custom = 1;
     .antigravity.localharness.AppendedSystemInstructions appended = 2;
   }
   repeated .antigravity.localharness.TemplateOverride overrides = 3;
+  .antigravity.localharness.SystemInstructions.SectionHeaderFormat
+      section_header_format = 4;
 }
 message TemplateOverride {
   string title = 1;
@@ -198,6 +214,7 @@ message CustomSystemInstructions {
       .antigravity.localharness.SystemInstructionTemplate template = 2;
       string builtin_section = 3;
     }
+    string title = 4;
   }
   repeated .antigravity.localharness.CustomSystemInstructions.Part part = 1;
 }
@@ -224,6 +241,7 @@ message Tool {
   string parameters_json_schema = 3;
   string response_json_schema = 4;
   bool defer_loading = 5;
+  .antigravity.localharness.ToolOutputTruncation tool_output_truncation = 8;
   extensions 1000 to 1999;
   extensions 2000 to max;
 }
@@ -264,6 +282,8 @@ message SubagentsConfig {
   bool enabled = 1;
   int32 max_nesting_depth = 2 [default = 1];
   repeated string allowed_subagents = 3;
+  bool disable_define_subagent_tool = 4;
+  bool disable_manage_subagents_tool = 5;
 }
 message UserQuestionsConfig {
   bool enabled = 1;
@@ -305,8 +325,17 @@ message SkillSource {
   }
 }
 message SkillsConfig {
+  enum PresentationMode {
+    PRESENTATION_MODE_UNSPECIFIED = 0;
+    TOOL = 1;
+    FILE_SYSTEM = 2;
+  }
   bool enabled = 1 [default = true];
   repeated .antigravity.localharness.SkillSource skills = 2;
+  map<string, string> skill_versions = 3;
+  .antigravity.localharness.SkillsConfig.PresentationMode presentation_mode = 4;
+  string materialized_skills_dir = 5;
+  repeated string preactivate_skills = 6;
 }
 message ManageTaskToolConfig {
   bool enabled = 1;
@@ -326,6 +355,8 @@ message OutputConfig {
   string api_key = 2;
 }
 message OutputEvent {
+  int64 seq_num = 1;
+  int64 timestamp_micros = 2;
   oneof event {
     .antigravity.localharness.StepUpdate step_update = 10;
     .antigravity.localharness.TrajectoryStateUpdate trajectory_state_update =
@@ -339,8 +370,6 @@ message OutputEvent {
         16;
     .antigravity.localharness.UsageUpdate usage_update = 17;
   }
-  int64 seq_num = 1;
-  int64 timestamp_micros = 2;
 }
 message SandboxStatus {
   bool available = 1;
@@ -435,11 +464,11 @@ message ActionError {
 }
 message ActionListDirectory {
   message Result {
+    string name = 1;
     oneof info {
       bool is_directory = 2;
       uint64 file_size = 3;
     }
-    string name = 1;
   }
   string directory_path = 1;
   repeated .antigravity.localharness.ActionListDirectory.Result results = 2;
@@ -598,13 +627,13 @@ message UserQuestionsResponse {
   message QuestionsResponse {
     repeated .antigravity.localharness.UserQuestionAnswer answers = 1;
   }
+  string trajectory_id = 1;
+  uint32 step_index = 2;
   oneof result {
     bool cancelled = 3;
     .antigravity.localharness.UserQuestionsResponse.QuestionsResponse response =
         4;
   }
-  string trajectory_id = 1;
-  uint32 step_index = 2;
 }
 message UserQuestionAnswer {
   oneof answer {
@@ -646,11 +675,11 @@ message McpServerConfig {
     AUTH_PROVIDER_TYPE_UNSPECIFIED = 0;
     AUTH_PROVIDER_TYPE_GOOGLE_CREDENTIALS = 1;
   }
+  string name = 1;
   oneof transport {
     .antigravity.localharness.McpStdioTransport stdio = 2;
     .antigravity.localharness.McpHttpTransport http = 3;
   }
-  string name = 1;
   repeated string enabled_tools = 4;
   repeated string disabled_tools = 5;
   .antigravity.localharness.McpServerConfig.AuthProviderType
@@ -695,6 +724,10 @@ message ActionRunWorkflow {
   string script = 4;
 }
 message CallHookRequest {
+  string request_id = 1;
+  string name = 2;
+  .antigravity.localharness.LifecycleHook type = 7;
+  string client_id = 11;
   oneof args {
     .antigravity.localharness.PreTurnArgs pre_turn_args = 3;
     .antigravity.localharness.PostTurnArgs post_turn_args = 4;
@@ -704,12 +737,9 @@ message CallHookRequest {
     .antigravity.localharness.OnCompactionArgs on_compaction_args = 9;
     .antigravity.localharness.StopArgs stop_args = 10;
   }
-  string request_id = 1;
-  string name = 2;
-  .antigravity.localharness.LifecycleHook type = 7;
-  string client_id = 11;
 }
 message CallHookResponse {
+  string request_id = 1;
   oneof result {
     .antigravity.localharness.PreTurnResult pre_turn_result = 2;
     .antigravity.localharness.PreToolResult pre_tool_result = 3;
@@ -718,7 +748,6 @@ message CallHookResponse {
     .antigravity.localharness.OnToolErrorResult on_tool_error_result = 6;
     .antigravity.localharness.StopResult stop_result = 7;
   }
-  string request_id = 1;
 }
 message PreToolArgs {
   string tool_name = 1;
@@ -891,8 +920,16 @@ message BudgetConfig {
   .antigravity.localharness.BudgetConfig.BudgetScope scope = 6;
 }
 message CompactionConfig {
+  message StepCompaction {
+    int32 max_inline_frames = 1;
+    int64 media_byte_threshold = 2;
+    string note_line_prefix = 3;
+  }
   uint32 token_threshold = 1;
   uint32 checkpoint_interval_tokens = 2;
   uint32 max_context_tokens = 3;
   string summary_prompt_override = 4;
+  bool use_model_reported_token_count = 5;
+  bool include_last_user_message = 6;
+  .antigravity.localharness.CompactionConfig.StepCompaction step_compaction = 7;
 }

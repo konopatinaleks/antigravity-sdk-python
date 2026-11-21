@@ -16,6 +16,7 @@
 
 import asyncio
 import dataclasses
+import functools
 import threading
 import typing
 from typing import Optional, Union
@@ -271,6 +272,18 @@ class ToolRunnerTest(absltest.TestCase):
     runner.register(tool)
     self.assertEqual(runner.tool_names, ["SyncCallable"])
 
+  def test_register_functools_partial_uses_wrapped_func_name(self):
+    """Verifies registering functools.partial uses func.__name__ instead of 'partial'."""
+
+    def add(prefix: str, value: str) -> str:
+      return f"{prefix}:{value}"
+
+    partial_tool = functools.partial(add, "tag")
+    runner = tool_runner.ToolRunner([partial_tool])
+    self.assertEqual(runner.tool_names, ["add"])
+    result = asyncio.run(runner.execute("add", value="ok"))
+    self.assertEqual(result, "tag:ok")
+
   def test_tool_with_schema_no_name(self):
     """Verifies ToolWithSchema handles callable object without __name__."""
 
@@ -380,6 +393,32 @@ class ToolRunnerTest(absltest.TestCase):
     runner = tool_runner.ToolRunner([wrapped])
     coerced = runner._coerce_args(wrapped, {"val": "21"})
     self.assertEqual(coerced, {"val": 21})
+
+  def test_coerce_args_empty_kwargs(self):
+    """Verifies that _coerce_args short-circuits immediately when kwargs is empty."""
+
+    def _tool(a: int) -> int:
+      return a
+
+    runner = tool_runner.ToolRunner([_tool])
+    with mock.patch.object(
+        tool_runner, "_get_callable_signature_and_hints"
+    ) as mock_get_info:
+      coerced = runner._coerce_args(_tool, {})
+      self.assertEqual(coerced, {})
+      mock_get_info.assert_not_called()
+
+  def test_coerce_args_reuses_cached_signature_and_hints(self):
+    """Verifies that _coerce_args reuses cached callable introspection."""
+
+    def _tool(a: int) -> int:
+      return a
+
+    runner = tool_runner.ToolRunner([_tool])
+    coerced1 = runner._coerce_args(_tool, {"a": "123"})
+    coerced2 = runner._coerce_args(_tool, {"a": "456"})
+    self.assertEqual(coerced1, {"a": 123})
+    self.assertEqual(coerced2, {"a": 456})
 
   def test_execute_coerces_arguments(self):
     """Verifies that execute() automatically coerces argument types."""
@@ -974,6 +1013,15 @@ class ContextInjectionTest(absltest.TestCase):
             "tool_context_module.ToolContext"
         )
     )
+    self.assertTrue(tool_runner._is_tool_context_annotation("agy.ToolContext"))
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation("antigravity.ToolContext")
+    )
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation(
+            "google.antigravity.ToolContext"
+        )
+    )
     # Union types
     self.assertTrue(
         tool_runner._is_tool_context_annotation(
@@ -999,6 +1047,9 @@ class ContextInjectionTest(absltest.TestCase):
         tool_runner._is_tool_context_annotation(
             "Optional[tool_context.ToolContext]"
         )
+    )
+    self.assertTrue(
+        tool_runner._is_tool_context_annotation("Optional[agy.ToolContext]")
     )
     self.assertTrue(
         tool_runner._is_tool_context_annotation(
@@ -1124,6 +1175,9 @@ class SchemaGenerationTest(absltest.TestCase):
     sig = inspect.signature(public)
     self.assertIn("query", sig.parameters)
     self.assertNotIn("ctx", sig.parameters)
+    self.assertIn("query", getattr(public, "__annotations__", {}))
+    self.assertNotIn("ctx", getattr(public, "__annotations__", {}))
+    self.assertIsNone(tool_runner._find_context_param(public))
 
   def test_public_callable_for_unknown_tool_raises(self):
     """Verifies that get_public_callable raises for unknown tools.

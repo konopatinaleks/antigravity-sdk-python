@@ -19,8 +19,6 @@ import os
 import pathlib
 import tempfile
 from typing import Any, Callable, Sequence
-import urllib.parse
-import urllib.request
 
 import pydantic
 
@@ -45,7 +43,7 @@ BUILTIN_TOOL_PROTO_FIELDS: dict[types.BuiltinTools, str] = {
     types.BuiltinTools.RUN_COMMAND: "run_command",
     types.BuiltinTools.SEARCH_DIR: "search_directory",
     types.BuiltinTools.VIEW_FILE: "view_file",
-    types.BuiltinTools.START_SUBAGENT: "invoke_subagent",
+    types.BuiltinTools.INVOKE_SUBAGENT: "invoke_subagent",
     types.BuiltinTools.RUN_WORKFLOW: "run_workflow",
     types.BuiltinTools.GENERATE_IMAGE: "generate_image",
     types.BuiltinTools.SEARCH_WEB: "search_web",
@@ -53,15 +51,19 @@ BUILTIN_TOOL_PROTO_FIELDS: dict[types.BuiltinTools, str] = {
     types.BuiltinTools.FINISH: "finish",
 }
 
-# Reverse map from canonical StepUpdate proto field name to SDK public
-# BuiltinTools value.
+# Reverse map from canonical StepUpdate proto field name to SDK tool name
+# (including harness-internal actions like skill_lookup that are not exposed
+# on the public BuiltinTools enum).
 PROTO_FIELD_TO_SDK_NAME: dict[str, str] = {
-    v: k.value for k, v in BUILTIN_TOOL_PROTO_FIELDS.items()
+    **{v: k.value for k, v in BUILTIN_TOOL_PROTO_FIELDS.items()},
+    "skill_lookup": "skill_lookup",
 }
 
 # Argument keys in tool call JSON payloads that carry wire-format URIs
 # (file:///..., cns://...) and must be normalized to clean filesystem paths.
-WIRE_PATH_ARGUMENT_KEYS: frozenset[str] = frozenset({
+# Stored as a tuple with fixed priority order so canonical path resolution is
+# deterministic.
+WIRE_PATH_ARGUMENT_KEYS: tuple[str, ...] = (
     "path",
     "file_path",
     "directory_path",
@@ -69,66 +71,36 @@ WIRE_PATH_ARGUMENT_KEYS: frozenset[str] = frozenset({
     "output_path",
     "script_path",
     "ScriptPath",
-})
+)
+
+normalize_wire_path = connection.normalize_wire_path
+normalize_workspace_path = connection.normalize_workspace_path
+normalize_workspace_paths = connection.normalize_workspace_paths
+make_step_id = connection.make_step_id
 
 
-def normalize_wire_path(path: str) -> str:
-  """Translates wire-format URIs to clean absolute filesystem paths.
+def normalize_path_arguments(args: dict[str, Any]) -> str | None:
+  """Normalizes wire-format URIs to clean filesystem paths in-place.
 
-  Paths arrive as file:/// or cns:// URIs over the wire protocol.
-  This converts them to platform-native absolute paths that user code expects.
+  Paths arrive as file:/// or cns:// URIs over the wire protocol. User hooks and
+  policy checks expect clean absolute paths, so we normalize known path fields
+  before dispatch.
+
+  Args:
+    args: The tool call arguments dictionary to normalize in-place.
+
+  Returns:
+    The canonical path (the first normalized path field found), or None.
   """
-  parsed = urllib.parse.urlparse(path)
-  if parsed.scheme == "file":
-    # urlparse("file:///abs/path").path == "/abs/path"
-    # url2pathname converts URL path to platform-native path
-    return urllib.request.url2pathname(parsed.path)
-  if parsed.scheme == "cns":
-    # urlparse("cns://el-d/home/user/...").netloc == "el-d"
-    # urlparse("cns://el-d/home/user/...").path == "/home/user/..."
-    # Convert to the canonical /cns/<cell>/... absolute path format.
-    return "/cns/" + parsed.netloc + parsed.path
-  return path
-
-
-def normalize_workspace_path(path: str | os.PathLike[str]) -> str:
-  """Normalizes wire URIs, expands user home ~, and resolves relative paths."""
-  path_str = os.fspath(path)
-  if not path_str:
-    return ""
-  normalized = normalize_wire_path(path_str)
-  if normalized.startswith("/cns/"):
-    return normalized
-  parsed = urllib.parse.urlparse(normalized)
-  if not parsed.scheme or parsed.scheme == "file":
-    return str(pathlib.Path(normalized).expanduser().resolve())
-  return normalized
-
-
-def normalize_workspace_paths(
-    workspaces: (
-        Sequence[str | os.PathLike[str]] | str | os.PathLike[str] | None
-    ),
-    *,
-    default_to_cwd: bool = False,
-) -> list[str]:
-  """Coerces single/sequence workspace paths and normalizes each entry."""
-  if workspaces is None:
-    return [os.getcwd()] if default_to_cwd else []
-  if isinstance(workspaces, (str, os.PathLike)):
-    return [normalize_workspace_path(workspaces)]
-  if isinstance(workspaces, (list, tuple, Sequence)) and not isinstance(
-      workspaces, (str, bytes)
-  ):
-    return [normalize_workspace_path(ws) for ws in workspaces]
-  raise ValueError(
-      f"workspaces must be a sequence of paths, got {type(workspaces).__name__}"
-  )
-
-
-def make_step_id(trajectory_id: str, step_index: int) -> str:
-  """Creates a unique step identifier from trajectory ID and step index."""
-  return f"{trajectory_id}:{step_index}" if trajectory_id else str(step_index)
+  canonical_path: str | None = None
+  for key in WIRE_PATH_ARGUMENT_KEYS:
+    val = args.get(key)
+    if isinstance(val, str) and val:
+      normalized = normalize_wire_path(val)
+      args[key] = normalized
+      if canonical_path is None:
+        canonical_path = normalized
+  return canonical_path
 
 
 class BaseLocalAgentConfig(connection.AgentConfig):
@@ -395,57 +367,6 @@ class LocalAgentConfig(BaseLocalAgentConfig):
         app_data_dir=self.app_data_dir,
         skills_paths=self.skills_paths,
         inline_skills=self.inline_skills,
-        mcp_servers=self.mcp_servers,
-        env=self.env,
-        subagents=self.subagents,
-        debug_config=self.debug_config,
-        retry_config=self.retry_config,
-        budget_config=self.budget_config,
-        policies=list(self.policies) if self.policies is not None else None,
-        tools=self.tools,
-    )
-
-
-class InteractionsAgentConfig(LocalAgentConfig):
-  """Configuration for the local harness backend using the GAOS Interactions API.
-
-  Inherits all fields, validators, and model shorthand resolution from
-  ``LocalAgentConfig``, and creates an ``InteractionsConnectionStrategy``
-  that speaks the GAOS Interactions JSON protocol over WebSocket to
-  ``localharness``.
-  """
-
-  @pydantic.model_validator(mode="after")
-  def _validate_triggers(self) -> "InteractionsAgentConfig":
-    """Validates that unsupported triggers are not configured."""
-    if self.triggers:
-      raise types.AntigravityValidationError(
-          "Automated triggers are not yet supported with"
-          " InteractionsAgentConfig."
-      )
-    return self
-
-  def create_strategy(
-      self,
-      *,
-      tool_runner: Any,
-      hook_runner: Any,
-  ) -> "connection.ConnectionStrategy":
-    from google.antigravity.connections.local import interactions_connection  # pylint: disable=g-import-not-at-top
-
-    return interactions_connection.InteractionsConnectionStrategy(
-        tool_runner=tool_runner,
-        hook_runner=hook_runner,
-        models=self.models,
-        system_instructions=self._get_system_instructions(),
-        capabilities_config=self.capabilities,
-        compaction_config=self._get_effective_compaction_config(),
-        conversation_id=self.conversation_id,
-        session_continuation_mode=self.session_continuation_mode,
-        save_dir=self._get_or_create_save_dir(),
-        workspaces=self.workspaces,
-        app_data_dir=self.app_data_dir,
-        skills_paths=self.skills_paths,
         mcp_servers=self.mcp_servers,
         env=self.env,
         subagents=self.subagents,

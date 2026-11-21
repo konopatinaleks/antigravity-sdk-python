@@ -21,6 +21,7 @@ from absl.testing import absltest
 from google.antigravity.proto import localharness_pb2
 from google.antigravity import types
 from google.antigravity.connections.local import event_processor
+from google.antigravity.connections.local import local_connection_config
 from google.antigravity.connections.local import types as local_types
 from google.antigravity.connections.local.hook_router import HookRouter
 from google.antigravity.connections.local.hook_router import make_step_id
@@ -543,7 +544,7 @@ class HookRouterStructuredExtractionTest(absltest.TestCase):
         tool_name="invoke_subagent",
         result_str="",
         assertion_fn=lambda res: self.assertEqual(res.result, ""),
-        expected_name=types.BuiltinTools.START_SUBAGENT.value,
+        expected_name=types.BuiltinTools.INVOKE_SUBAGENT.value,
     )
 
   def test_extract_run_command(self):
@@ -1129,21 +1130,24 @@ class HookRouterPreToolTest(absltest.TestCase):
 
       router = HookRouter(hook_runner, lambda _: asyncio.sleep(0))
 
-      # invoke_subagent should be translated to start_subagent.
-      req = localharness_pb2.CallHookRequest(
-          request_id="test_name_translation",
-          name="PreTool",
-          type=localharness_pb2.LIFECYCLE_HOOK_PRE_TOOL,
-          pre_tool_args=localharness_pb2.PreToolArgs(
-              tool_name="invoke_subagent",
-              arguments_json="{}",
-          ),
-      )
+      # invoke_subagent should be preserved as invoke_subagent, and
+      # start_subagent should be translated to invoke_subagent.
+      for wire_name in ("invoke_subagent", "start_subagent"):
+        req = localharness_pb2.CallHookRequest(
+            request_id=f"test_name_translation_{wire_name}",
+            name="PreTool",
+            type=localharness_pb2.LIFECYCLE_HOOK_PRE_TOOL,
+            pre_tool_args=localharness_pb2.PreToolArgs(
+                tool_name=wire_name,
+                arguments_json="{}",
+            ),
+        )
 
-      await router.handle(req)
+        await router.handle(req)
 
-      self.assertLen(captured_tool_calls, 1)
-      self.assertEqual(captured_tool_calls[0].name, "start_subagent")
+      self.assertLen(captured_tool_calls, 2)
+      self.assertEqual(captured_tool_calls[0].name, "invoke_subagent")
+      self.assertEqual(captured_tool_calls[1].name, "invoke_subagent")
 
     asyncio.run(_test())
 
@@ -1180,6 +1184,9 @@ class HookRouterPreToolTest(absltest.TestCase):
       self.assertEqual(
           captured_tool_calls[0].args["file_path"], "/home/user/foo.py"
       )
+      self.assertEqual(
+          captured_tool_calls[0].canonical_path, "/home/user/foo.py"
+      )
 
       req2 = localharness_pb2.CallHookRequest(
           request_id="test_target_file_norm",
@@ -1196,6 +1203,109 @@ class HookRouterPreToolTest(absltest.TestCase):
       self.assertLen(captured_tool_calls, 2)
       self.assertEqual(
           captured_tool_calls[1].args["TargetFile"], "/home/user/bar.py"
+      )
+      self.assertEqual(
+          captured_tool_calls[1].canonical_path, "/home/user/bar.py"
+      )
+
+    asyncio.run(_test())
+
+  def test_normalize_path_arguments(self):
+    """Verifies normalize_path_arguments behavior and canonical_path resolution."""
+    # 1. Normalizes file:// and cns:// paths in-place, returning canonical_path.
+    args = {
+        "file_path": "file:///workspace/src/main.py",
+        "command": "build",
+    }
+    canonical = local_connection_config.normalize_path_arguments(args)
+    self.assertEqual(canonical, "/workspace/src/main.py")
+    self.assertEqual(args["file_path"], "/workspace/src/main.py")
+    self.assertEqual(args["command"], "build")
+
+    # 2. CNS URI conversion.
+    cns_args = {"path": "cns://el-d/home/user/data.txt"}
+    self.assertEqual(
+        local_connection_config.normalize_path_arguments(cns_args),
+        "/cns/el-d/home/user/data.txt",
+    )
+    self.assertEqual(cns_args["path"], "/cns/el-d/home/user/data.txt")
+
+    # 3. Deterministic precedence when multiple path keys are present.
+    multi_args = {
+        "output_path": "file:///tmp/output.png",
+        "path": "file:///workspace/doc.md",
+    }
+    self.assertEqual(
+        local_connection_config.normalize_path_arguments(multi_args),
+        "/workspace/doc.md",
+    )
+    self.assertEqual(multi_args["path"], "/workspace/doc.md")
+    self.assertEqual(multi_args["output_path"], "/tmp/output.png")
+
+    # 4. Returns None when no path arguments are present.
+    no_path_args = {"query": "search query", "limit": 10}
+    self.assertIsNone(
+        local_connection_config.normalize_path_arguments(no_path_args)
+    )
+
+    # 5. Empty or non-string path arguments are ignored.
+    empty_args = {"path": "", "file_path": None, "directory_path": 123}
+    self.assertIsNone(
+        local_connection_config.normalize_path_arguments(empty_args)
+    )
+
+    # 6. Dot-segment and percent-encoded traversal segments are collapsed.
+    traversal_args = {
+        "file_path": "file:///workspace/src/../../etc/passwd",
+        "output_path": "file:///workspace/%2e%2e/%2e%2e/tmp/out.txt",
+        "directory_path": "/workspace/sub/../..",
+    }
+    self.assertEqual(
+        local_connection_config.normalize_path_arguments(traversal_args),
+        "/etc/passwd",
+    )
+    self.assertEqual(traversal_args["file_path"], "/etc/passwd")
+    self.assertEqual(traversal_args["output_path"], "/tmp/out.txt")
+    self.assertEqual(traversal_args["directory_path"], "/")
+
+  def test_handle_pre_tool_collapses_traversal_for_workspace_hook(self):
+    """Verifies a prefix-checking hook denies a traversal path via HookRouter."""
+
+    async def _test():
+      sent_events = []
+
+      @hooks.pre_tool_call_decide
+      async def workspace_only_hook(tc):
+        if tc.canonical_path and tc.canonical_path.startswith("/workspace/"):
+          return hooks.HookResult(allow=True)
+        return hooks.HookResult(allow=False, message="Outside workspace")
+
+      hook_runner = h_runner.HookRunner(
+          pre_tool_call_decide_hooks=[workspace_only_hook],
+      )
+
+      async def capture_send(event):
+        sent_events.append(event)
+
+      router = HookRouter(hook_runner, capture_send)
+      req = localharness_pb2.CallHookRequest(
+          request_id="test_traversal_deny",
+          name="PreTool",
+          type=localharness_pb2.LIFECYCLE_HOOK_PRE_TOOL,
+          pre_tool_args=localharness_pb2.PreToolArgs(
+              tool_name="view_file",
+              arguments_json=(
+                  '{"file_path":'
+                  ' "file:///workspace/src/%2e%2e/%2e%2e/etc/passwd"}'
+              ),
+          ),
+      )
+      await router.handle(req)
+
+      self.assertLen(sent_events, 1)
+      self.assertEqual(
+          sent_events[0].call_hook_response.pre_tool_result.decision,
+          localharness_pb2.PreToolResult.Decision.DENY,
       )
 
     asyncio.run(_test())

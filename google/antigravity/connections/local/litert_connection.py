@@ -44,6 +44,46 @@ _WARMUP_REQUEST_TIMEOUT_SECONDS = 120
 _DEFAULT_THINKING_TOKEN_BUDGET = 8192
 
 
+def _detect_default_vision_backend(
+    model_path: str,
+) -> litert_connection_config.LiteRTBackend | None:
+  """Detects whether model supports vision and returns default vision backend."""
+  # Requires the ModelInfo API in litert-lm 0.19.0 or above.
+  if litert_lm is None or not hasattr(litert_lm, "ModelInfo"):
+    return None
+
+  try:
+    with litert_lm.ModelInfo(model_path) as model_info:
+      input_modalities = getattr(model_info, "input_modalities", None)
+      if getattr(input_modalities, "vision", None) is not True:
+        return None
+      supported = None
+      if hasattr(model_info, "supported_backends_for_modality") and hasattr(
+          litert_lm, "LiteRtLmModality"
+      ):
+        try:
+          supported = model_info.supported_backends_for_modality(
+              litert_lm.LiteRtLmModality.VISION
+          )
+        except Exception:  # pylint: disable=broad-exception-caught
+          supported = None
+      if isinstance(supported, list):
+        for backend in supported:
+          normalized_backend = str(backend).strip().lower()
+          if normalized_backend == "gpu":
+            return litert_connection_config.LiteRTBackend.GPU
+          if normalized_backend == "cpu":
+            return litert_connection_config.LiteRTBackend.CPU
+      return litert_connection_config.LiteRTBackend.CPU
+  except Exception:  # pylint: disable=broad-exception-caught
+    logging.warning(
+        "Failed to inspect model info for vision detection at %s",
+        model_path,
+        exc_info=True,
+    )
+    return None
+
+
 class LiteRTConnectionStrategy(
     local_openai_connection.LocalOpenAIConnectionStrategy
 ):
@@ -197,9 +237,10 @@ class LiteRTConnectionStrategy(
     engine_audio = (
         map_backend(self._audio_backend) if self._audio_backend else None
     )
-    engine_vision = (
-        map_backend(self._vision_backend) if self._vision_backend else None
+    vision_backend = self._vision_backend or _detect_default_vision_backend(
+        self._model_path
     )
+    engine_vision = map_backend(vision_backend) if vision_backend else None
 
     try:
       # Load engine context manager
@@ -357,7 +398,7 @@ class LiteRTConnectionStrategy(
       await super().__aenter__()
 
     # pylint: disable=broad-exception-caught
-    except Exception:
+    except BaseException:
       try:
         self._shutdown_server()
       finally:
@@ -374,10 +415,11 @@ class LiteRTConnectionStrategy(
         if self._openai_server_thread is not None:
           self._openai_server_thread.join()
           self._openai_server_thread = None
-      # pylint: disable=broad-exception-caught
       except Exception as e:  # pylint: disable=broad-exception-caught
         logging.exception("Error during loopback API server shutdown: %s", e)
       finally:
+        with self._openai_server.engine_lock:
+          self._openai_server.close_conversation()
         self._openai_server = None
 
   def _close_engine(self) -> None:
@@ -442,8 +484,7 @@ def _check_gpu_acceleration_available() -> bool:
       ).strip()
       if out == b"1":
         return True
-    # pylint: disable=broad-exception-caught
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
       pass
   elif sys.platform.startswith("linux") or sys.platform == "win32":
     if shutil.which("nvidia-smi") is not None:
@@ -453,8 +494,7 @@ def _check_gpu_acceleration_available() -> bool:
 
         subprocess.check_output(["nvidia-smi"], stderr=subprocess.DEVNULL)
         return True
-      # pylint: disable=broad-exception-caught
-      except Exception:
+      except Exception:  # pylint: disable=broad-exception-caught
         pass
 
     # Soft check for loaded graphics drivers DLLs
@@ -472,7 +512,6 @@ def _check_gpu_acceleration_available() -> bool:
         except Exception:  # pylint: disable=broad-exception-caught
           ctypes.CDLL("libcuda.so.1")
           return True
-    # pylint: disable=broad-exception-caught
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
       pass
   return False

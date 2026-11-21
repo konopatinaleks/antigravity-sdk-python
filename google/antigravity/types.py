@@ -27,10 +27,11 @@ import logging
 import math
 import mimetypes
 import pathlib
-from typing import Annotated, Any, AsyncIterator, Callable, ClassVar, Literal, TypeVar, cast
+from typing import Annotated, Any, AsyncIterator, Callable, ClassVar, Generic, Literal, TypeVar, cast
 import warnings
 
 import pydantic
+import typing_extensions
 
 from google.antigravity import beta as _beta_lib
 from google.antigravity.models import GeminiAPIEndpoint
@@ -43,6 +44,20 @@ from google.antigravity.models import ThinkingLevel
 from google.antigravity.models import VertexEndpoint
 
 _BaseMediaT = TypeVar("_BaseMediaT", bound="_BaseMedia")
+_T = TypeVar("_T")
+
+DEPRECATED_START_SUBAGENT = "start_subagent"
+
+
+class _classproperty(Generic[_T]):  # pylint: disable=invalid-name
+  """Descriptor for class-level properties (such as deprecated enum aliases)."""
+
+  def __init__(self, fget: Callable[[Any], _T]) -> None:
+    self.fget = fget
+    self.__deprecated__ = getattr(fget, "__deprecated__", None)
+
+  def __get__(self, instance: Any, owner: type[Any] | None = None) -> _T:
+    return self.fget(owner if owner is not None else type(instance))
 
 __all__ = [
     "ThinkingLevel",
@@ -146,6 +161,9 @@ class CustomSystemInstructions(pydantic.BaseModel):
   """
 
   text: str
+  # Optional prompt-section title; renders the text under <title> tags
+  # instead of the generic <System>.
+  title: str | None = None
 
 
 class TemplatedSystemInstructions(pydantic.BaseModel):
@@ -268,16 +286,16 @@ class SubagentCapabilities(pydantic.BaseModel):
   def _validate_subagents_and_tools(self) -> "SubagentCapabilities":
     subagent_disabled = (
         self.disabled_tools is not None
-        and BuiltinTools.START_SUBAGENT in self.disabled_tools
+        and BuiltinTools.INVOKE_SUBAGENT in self.disabled_tools
         and BuiltinTools.RUN_WORKFLOW in self.disabled_tools
     ) or (
         self.enabled_tools is not None
-        and BuiltinTools.START_SUBAGENT not in self.enabled_tools
+        and BuiltinTools.INVOKE_SUBAGENT not in self.enabled_tools
         and BuiltinTools.RUN_WORKFLOW not in self.enabled_tools
     )
     if subagent_disabled and self.allowed_subagents is not None:
       raise ValueError(
-          "allowed_subagents cannot be specified when START_SUBAGENT is"
+          "allowed_subagents cannot be specified when INVOKE_SUBAGENT is"
           " disabled or omitted from enabled_tools."
       )
     return self
@@ -492,7 +510,8 @@ class BuiltinTools(str, enum.Enum):
     EDIT_FILE: Edit an existing file.
     RUN_COMMAND: Execute a shell command.
     ASK_QUESTION: Ask the user a clarifying question.
-    START_SUBAGENT: Invoke a subagent.
+    INVOKE_SUBAGENT: Invoke a subagent.
+    START_SUBAGENT: Deprecated alias for INVOKE_SUBAGENT.
     RUN_WORKFLOW: Execute a multi-agent workflow script.
     GENERATE_IMAGE: Generate or edit images.
     SEARCH_WEB: Search the web.
@@ -509,13 +528,37 @@ class BuiltinTools(str, enum.Enum):
   EDIT_FILE = "edit_file"
   RUN_COMMAND = "run_command"
   ASK_QUESTION = "ask_question"
-  START_SUBAGENT = "start_subagent"
+  INVOKE_SUBAGENT = "invoke_subagent"
   RUN_WORKFLOW = "run_workflow"
   GENERATE_IMAGE = "generate_image"
   SEARCH_WEB = "search_web"
   READ_URL_CONTENT = "read_url_content"
   SCHEDULE = "schedule"
   FINISH = "finish"
+
+  def __str__(self) -> str:
+    return self.value
+
+  @_classproperty
+  @typing_extensions.deprecated(
+      "BuiltinTools.START_SUBAGENT is deprecated; use"
+      " BuiltinTools.INVOKE_SUBAGENT instead.",
+      stacklevel=2,
+  )
+  def START_SUBAGENT(cls) -> "BuiltinTools":  # pylint: disable=invalid-name,no-self-argument
+    return cls.INVOKE_SUBAGENT
+
+  @classmethod
+  def _missing_(cls, value: object) -> "BuiltinTools | None":
+    if value == DEPRECATED_START_SUBAGENT:
+      warnings.warn(
+          f"{DEPRECATED_START_SUBAGENT!r} is deprecated; use"
+          f" {cls.INVOKE_SUBAGENT.value!r} instead.",
+          DeprecationWarning,
+          stacklevel=3,
+      )
+      return cls.INVOKE_SUBAGENT
+    return None
 
   @classmethod
   def read_only(cls) -> list["BuiltinTools"]:
@@ -547,7 +590,7 @@ class BuiltinTools(str, enum.Enum):
         cls.CREATE_FILE,
         cls.EDIT_FILE,
         cls.ASK_QUESTION,
-        cls.START_SUBAGENT,
+        cls.INVOKE_SUBAGENT,
         cls.RUN_WORKFLOW,
         cls.GENERATE_IMAGE,
         cls.SEARCH_WEB,
@@ -638,6 +681,18 @@ class BuiltinTools(str, enum.Enum):
     return [t for t in cls if t not in excluded]
 
 
+BuiltinTools._member_map_["START_SUBAGENT"] = BuiltinTools.INVOKE_SUBAGENT  # pylint: disable=protected-access
+
+
+def normalize_builtin_tool_name(
+    name: BuiltinTools | str, *, server_name: str | None = None
+) -> BuiltinTools | str:
+  """Normalizes deprecated builtin tool name aliases unless scoped to an MCP server."""
+  if name == DEPRECATED_START_SUBAGENT and not server_name:
+    return BuiltinTools.INVOKE_SUBAGENT.value
+  return name
+
+
 class CapabilitiesConfig(pydantic.BaseModel):
   """General agent capability configuration.
 
@@ -691,6 +746,10 @@ class CapabilitiesConfig(pydantic.BaseModel):
     run_command_config: Optional configuration for the builtin run_command tool.
     tool_output_truncation_config: Optional configuration or token limit for
       truncating large tool outputs (preserves beginning, truncates end).
+    mcp_max_output_bytes: Maximum size in bytes of an MCP tool output or
+      resource read before the runtime spills the output to a file on disk
+      instead of inlining it in the model context. Must be positive when
+      specified. When None, the runtime's default limit (4096 bytes) is used.
   """
 
   enable_subagents: bool = True
@@ -711,6 +770,9 @@ class CapabilitiesConfig(pydantic.BaseModel):
   allowed_subagents: list[str] | None = None
   run_command_config: RunCommandConfig | None = None
   tool_output_truncation_config: ToolOutputTruncationConfig | None = None
+  mcp_max_output_bytes: int | None = pydantic.Field(
+      default=None, gt=0, le=_MAX_INT32
+  )
 
   @pydantic.field_validator("tool_output_truncation_config", mode="before")
   @classmethod
@@ -744,12 +806,12 @@ class CapabilitiesConfig(pydantic.BaseModel):
         not self.enable_subagents
         or (
             self.disabled_tools is not None
-            and BuiltinTools.START_SUBAGENT in self.disabled_tools
+            and BuiltinTools.INVOKE_SUBAGENT in self.disabled_tools
             and BuiltinTools.RUN_WORKFLOW in self.disabled_tools
         )
         or (
             self.enabled_tools is not None
-            and BuiltinTools.START_SUBAGENT not in self.enabled_tools
+            and BuiltinTools.INVOKE_SUBAGENT not in self.enabled_tools
             and BuiltinTools.RUN_WORKFLOW not in self.enabled_tools
         )
     )
@@ -757,7 +819,7 @@ class CapabilitiesConfig(pydantic.BaseModel):
       if self.max_subagent_depth is not None:
         raise ValueError(
             "max_subagent_depth cannot be configured when subagents are"
-            " disabled (enable_subagents=False or START_SUBAGENT not enabled)."
+            " disabled (enable_subagents=False or INVOKE_SUBAGENT not enabled)."
         )
       if self.allowed_subagents is not None:
         raise ValueError(
@@ -984,6 +1046,13 @@ class ToolCall(pydantic.BaseModel):
   canonical_path: str | None = None
   server_name: str | None = None
 
+  @pydantic.model_validator(mode="after")
+  def _normalize_builtin_name(self) -> "ToolCall":
+    self.name = normalize_builtin_tool_name(
+        self.name, server_name=getattr(self, "server_name", None)
+    )
+    return self
+
 
 class ToolResult(pydantic.BaseModel):
   """Result of a single tool execution.
@@ -1010,6 +1079,13 @@ class ToolResult(pydantic.BaseModel):
   error: str | None = None
   exception: Exception | None = pydantic.Field(default=None, exclude=True)
   server_name: str | None = None
+
+  @pydantic.model_validator(mode="after")
+  def _normalize_builtin_name(self) -> "ToolResult":
+    self.name = normalize_builtin_tool_name(
+        self.name, server_name=getattr(self, "server_name", None)
+    )
+    return self
 
 
 PythonTool = Callable[..., Any]
@@ -1688,6 +1764,24 @@ class ChatResponse:
     self._is_done = False
     self._stream_error: BaseException | None = None
     self._pull_lock = asyncio.Lock()
+    self._structured_output: Any | None = None
+    self._usage_metadata: UsageMetadata | None = None
+    self._stop_reason: StopReason = StopReason.UNSPECIFIED
+
+  def _finalize(self, error: BaseException | None = None) -> None:
+    """Snapshots turn-level metadata once the stream terminates."""
+    self._stream_error = error
+    if self._conversation is not None:
+      if error is None:
+        self._structured_output = (
+            self._conversation.get_last_structured_output()
+        )
+      usage = self._conversation.last_turn_usage
+      self._usage_metadata = (
+          usage.model_copy() if isinstance(usage, UsageMetadata) else usage
+      )
+      self._stop_reason = self._conversation._last_turn_stop_reason  # pylint: disable=protected-access
+    self._is_done = True
 
   @property
   def chunks(self) -> AsyncIterator[StreamChunk | ToolCall | ToolResult]:
@@ -1726,10 +1820,9 @@ class ChatResponse:
             try:
               chunk = await self._chunk_stream.__anext__()
             except StopAsyncIteration:
-              self._is_done = True
+              self._finalize()
             except (asyncio.CancelledError, Exception) as e:
-              self._is_done = True
-              self._stream_error = e
+              self._finalize(error=e)
               raise
             else:
               self._buffered_chunks.append(chunk)
@@ -1786,19 +1879,35 @@ class ChatResponse:
 
     Returns:
         The parsed structured output if available, otherwise None.
+
+    Raises:
+        asyncio.CancelledError: If the underlying stream was cancelled.
+        Exception: If the underlying stream terminated with an error.
     """
     if not self._is_done:
       await self.resolve()
-    return self._conversation.get_last_structured_output()
+    if self._stream_error is not None:
+      raise self._stream_error
+    return self._structured_output
 
   @property
   def usage_metadata(self) -> UsageMetadata | None:
     """Accumulated token usage across all model invocations in this turn."""
-    return self._conversation.last_turn_usage
+    if self._is_done:
+      usage = self._usage_metadata
+    elif self._conversation is not None:
+      usage = self._conversation.last_turn_usage
+    else:
+      return None
+    return usage.model_copy() if isinstance(usage, UsageMetadata) else usage
 
   @property
   def stop_reason(self) -> StopReason:
     """The reason why the execution turn stopped."""
+    if self._is_done:
+      return self._stop_reason
+    if self._conversation is None:
+      return StopReason.UNSPECIFIED
     return self._conversation._last_turn_stop_reason  # pylint: disable=protected-access
 
   async def cancel(self) -> None:
@@ -1807,7 +1916,7 @@ class ChatResponse:
     This cleanly aborts the active stream on the backend. If the stream is
     already completed, this method acts as a safe no-op.
     """
-    if not self._is_done:
+    if not self._is_done and self._conversation is not None:
       await self._conversation.cancel()
 
 
@@ -1873,7 +1982,7 @@ class WorkflowResult(ChatResponse):
       self._buffered_chunks = (
           [Text(step_index=0, text=response_text)] if response_text else []
       )
-      self._is_done = True
+      self._finalize()
 
   @classmethod
   def _from_chat_response(
@@ -1896,10 +2005,10 @@ class WorkflowResult(ChatResponse):
         output=output,
         response_text=response_text,
     )
-    if hasattr(chat_resp, "_buffered_chunks"):
-      res._buffered_chunks = list(chat_resp._buffered_chunks)  # pylint: disable=protected-access
-      res._is_done = getattr(chat_resp, "_is_done", True)  # pylint: disable=protected-access
-      res._stream_error = getattr(chat_resp, "_stream_error", None)  # pylint: disable=protected-access
+    if issubclass(type(chat_resp), ChatResponse):
+      res.__dict__.update(
+          {k: v for k, v in chat_resp.__dict__.items() if k.startswith("_")}
+      )
     return res
 
 
@@ -1971,7 +2080,7 @@ def _read_file_safely(path: str | pathlib.Path) -> bytes:
       PermissionError: If the file is not readable.
       OSError: For other filesystem errors.
   """
-  file_path = pathlib.Path(path)
+  file_path = pathlib.Path(path).expanduser()
   try:
     return file_path.read_bytes()
   except FileNotFoundError as exc:
@@ -2003,7 +2112,7 @@ def _read_file_and_guess_mime(
   Raises:
       ValueError: If the MIME type cannot be guessed.
   """
-  file_path = pathlib.Path(path)
+  file_path = pathlib.Path(path).expanduser()
   data = _read_file_safely(file_path)
   mime_guess, _ = mimetypes.guess_type(file_path)
   if not mime_guess:
@@ -2026,11 +2135,12 @@ class _BaseMedia(pydantic.BaseModel):
   @classmethod
   def _validate_mime_type(cls, v: str) -> str:
     """Validates that the MIME type is supported for this media type."""
+    normalized = v.strip().lower()
     if cls is _BaseMedia:
-      return v
-    if v not in cls._SUPPORTED_MIMES:
+      return normalized
+    if normalized not in cls._SUPPORTED_MIMES:
       raise ValueError(f"Unsupported {cls.__name__} MIME type: '{v}'")
-    return v
+    return normalized
 
   @classmethod
   def from_file(
@@ -2158,7 +2268,8 @@ def from_bytes(
   Raises:
       ValueError: If the MIME type is unsupported.
   """
-  media_cls = _MIME_TO_MEDIA_CLASS.get(mime_type)
+  normalized_mime = mime_type.strip().lower()
+  media_cls = _MIME_TO_MEDIA_CLASS.get(normalized_mime)
   if media_cls is None:
     raise ValueError(
         f"Unsupported MIME type: '{mime_type}'. "
@@ -2166,5 +2277,5 @@ def from_bytes(
     )
   return cast(
       Image | Document | Audio | Video,
-      media_cls(data=data, mime_type=mime_type, description=description),
+      media_cls(data=data, mime_type=normalized_mime, description=description),
   )

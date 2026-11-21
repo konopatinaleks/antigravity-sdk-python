@@ -14,7 +14,9 @@
 
 """Tests for Agent API."""
 
+import asyncio
 import contextlib
+import errno
 import os
 import pathlib
 import tempfile
@@ -627,6 +629,101 @@ class AgentTest(unittest.IsolatedAsyncioTestCase):
 
     # TriggerRunner.stop() called during __aexit__.
     mock_runner_instance.stop.assert_called_once()
+
+  @mock.patch(
+      "google.antigravity.connections."
+      "local.local_connection.LocalConnectionStrategy"
+  )
+  @mock.patch.object(conversation.Conversation, "create")
+  @mock.patch(
+      "google.antigravity.agent."
+      "trigger_runner.TriggerRunner"
+  )
+  @mock.patch.object(agent.logging, "exception")
+  async def test_agent_aenter_cancelled_after_conversation_closes_exit_stack(
+      self,
+      mock_log_exception,
+      mock_trigger_runner_class,
+      mock_conv_create,
+      mock_strategy_class,
+  ):
+    """Verifies CancelledError in __aenter__ closes entered resources.
+
+    Why: asyncio.CancelledError inherits from BaseException, not Exception. If
+    cancellation arrives after Conversation.create() has entered _exit_stack
+    (for example while starting TriggerRunner), _exit_stack.aclose() must still
+    run so the underlying connection and localharness subprocess do not leak.
+    How: Mock Conversation.create() to succeed and TriggerRunner.__aenter__() to
+    raise CancelledError, then assert Conversation.__aexit__ is awaited without
+    logging a spurious error traceback.
+    """
+    mock_strategy_class.return_value = mock.MagicMock()
+    mock_conversation = mock.MagicMock(spec=conversation.Conversation)
+    mock_conversation.connection = mock.MagicMock()
+
+    mock_cm = mock.AsyncMock()
+    mock_cm.__aenter__.return_value = mock_conversation
+    mock_conv_create.return_value = mock_cm
+
+    mock_runner_instance = mock.AsyncMock()
+    mock_runner_instance.__aenter__.side_effect = asyncio.CancelledError()
+    mock_trigger_runner_class.return_value = mock_runner_instance
+
+    async def my_trigger(ctx):
+      del ctx  # Unused.
+
+    config = local_connection.LocalAgentConfig(
+        system_instructions="test", triggers=[my_trigger]
+    )
+    with self.assertRaises(asyncio.CancelledError):
+      async with agent.Agent(config):
+        pass
+
+    mock_cm.__aexit__.assert_awaited_once()
+    mock_log_exception.assert_not_called()
+
+  @mock.patch(
+      "google.antigravity.connections."
+      "local.local_connection.LocalConnectionStrategy"
+  )
+  @mock.patch.object(conversation.Conversation, "create")
+  @mock.patch(
+      "google.antigravity.agent."
+      "trigger_runner.TriggerRunner"
+  )
+  @mock.patch.object(agent.logging, "exception")
+  async def test_agent_aenter_exception_after_conversation_closes_exit_stack(
+      self,
+      mock_log_exception,
+      mock_trigger_runner_class,
+      mock_conv_create,
+      mock_strategy_class,
+  ):
+    """Verifies Exception during __aenter__ logs and closes _exit_stack."""
+    mock_strategy_class.return_value = mock.MagicMock()
+    mock_conversation = mock.MagicMock(spec=conversation.Conversation)
+    mock_conversation.connection = mock.MagicMock()
+
+    mock_cm = mock.AsyncMock()
+    mock_cm.__aenter__.return_value = mock_conversation
+    mock_conv_create.return_value = mock_cm
+
+    mock_runner_instance = mock.AsyncMock()
+    mock_runner_instance.__aenter__.side_effect = RuntimeError("trigger boom")
+    mock_trigger_runner_class.return_value = mock_runner_instance
+
+    async def my_trigger(ctx):
+      del ctx  # Unused.
+
+    config = local_connection.LocalAgentConfig(
+        system_instructions="test", triggers=[my_trigger]
+    )
+    with self.assertRaisesRegex(RuntimeError, "trigger boom"):
+      async with agent.Agent(config):
+        pass
+
+    mock_cm.__aexit__.assert_awaited_once()
+    mock_log_exception.assert_called_once()
 
   @mock.patch(
       "google.antigravity.connections."
@@ -1274,8 +1371,11 @@ class AgentConfigTest(unittest.IsolatedAsyncioTestCase):
     async with agent.Agent(config) as ag:
       with self.assertRaisesRegex(
           types.ToolExecutionError, "workflow execution failed"
-      ):
+      ) as cm:
         await ag.beta.run_workflow(failing_wf)
+      self.assertEqual(
+          cm.exception.tool_name, types.BuiltinTools.RUN_WORKFLOW.value
+      )
 
   @mock.patch.object(lc_module, "LocalConnectionStrategy", autospec=True)
   @mock.patch.object(conversation.Conversation, "create", autospec=True)
@@ -1296,7 +1396,10 @@ class AgentConfigTest(unittest.IsolatedAsyncioTestCase):
       script_file = pathlib.Path(ws_dir) / "my_workflow.py"
       script_file.write_text("phase('Audit')\nlog('done')\n", encoding="utf-8")
 
+      captured_prompts = []
+
       async def fake_chat(prompt: str):
+        captured_prompts.append(prompt)
         self.assertIn(str(script_file.resolve()), prompt)
         mock_conversation.history.append(
             types.Step(
@@ -1328,12 +1431,47 @@ class AgentConfigTest(unittest.IsolatedAsyncioTestCase):
           workspaces=[ws_dir],
       )
       async with agent.Agent(config) as ag:
-        # Pass relative script path resolved against workspace.
-        res = await ag.beta.run_workflow(script_path="my_workflow.py")
+        # Pass relative script path resolved against workspace and workflow
+        # args.
+        res = await ag.beta.run_workflow(
+            script_path="my_workflow.py",
+            args={"target": "auth.py", "retries": 2},
+        )
         self.assertEqual(res.script_path, str(script_file.resolve()))
         self.assertEqual(res.output, "done")
+        self.assertIn(
+            'with Args `{"target": "auth.py", "retries": 2}`',
+            captured_prompts[-1],
+        )
+        await ag.beta.run_workflow(script_path="my_workflow.py", args={})
+        self.assertNotIn("with Args", captured_prompts[-1])
         # User's script file must NOT be deleted after run_workflow completes.
         self.assertTrue(script_file.is_file())
+
+        bad_args: Any = ["not", "a", "dict"]
+        with self.assertRaisesRegex(
+            TypeError, r"run_workflow\(\) `args` must be a mapping"
+        ):
+          await ag.beta.run_workflow(
+              script_path="my_workflow.py",
+              args=bad_args,
+          )
+
+        with self.assertRaisesRegex(
+            ValueError, r"run_workflow\(\) `args` must be JSON-serializable"
+        ):
+          await ag.beta.run_workflow(
+              script_path="my_workflow.py",
+              args={"bad": object()},
+          )
+
+        with self.assertRaisesRegex(
+            ValueError, r"run_workflow\(\) `args` must be JSON-serializable"
+        ):
+          await ag.beta.run_workflow(
+              script_path="my_workflow.py",
+              args={"bad_float": float("nan")},
+          )
 
         with self.assertRaises(FileNotFoundError):
           await ag.beta.run_workflow(script_path="does_not_exist.py")
@@ -1385,8 +1523,142 @@ class AgentConfigTest(unittest.IsolatedAsyncioTestCase):
       with self.assertRaisesRegex(
           types.ToolExecutionError,
           "The model did not invoke the run_workflow tool",
-      ):
+      ) as cm:
         await ag.beta.run_workflow(sample_wf)
+      self.assertEqual(
+          cm.exception.tool_name, types.BuiltinTools.RUN_WORKFLOW.value
+      )
+
+  def test_materialize_workflow_function_falls_back_across_workspace_errors(
+      self,
+  ):
+    @workflows.define
+    def ro_wf():
+      workflows.phase("ReadOnlyCheck")
+
+    real_ntf = tempfile.NamedTemporaryFile
+    call_dirs = []
+
+    def fake_ntf(*args, **kwargs):
+      call_dirs.append(kwargs.get("dir"))
+      if kwargs.get("dir") is not None:
+        raise OSError(errno.EROFS, "Read-only file system")
+      return real_ntf(*args, **kwargs)
+
+    with tempfile.TemporaryDirectory() as ws_dir:
+      resolved_ws = str(pathlib.Path(ws_dir).resolve())
+      with mock.patch.object(
+          tempfile, "NamedTemporaryFile", side_effect=fake_ntf
+      ):
+        path, _, _ = agent._materialize_workflow_function(
+            ro_wf, [ws_dir], "desc"
+        )
+      try:
+        self.assertEqual(call_dirs, [resolved_ws, None])
+        self.assertTrue(os.path.isfile(path))
+      finally:
+        if os.path.exists(path):
+          os.unlink(path)
+
+    # Also verify fallback from a failing first workspace to a writable second
+    # workspace.
+    with (
+        tempfile.TemporaryDirectory() as ws_ro,
+        tempfile.TemporaryDirectory() as ws_rw,
+    ):
+      resolved_ro = str(pathlib.Path(ws_ro).resolve())
+      resolved_rw = str(pathlib.Path(ws_rw).resolve())
+
+      def fake_ntf_second_writable(*args, **kwargs):
+        if kwargs.get("dir") == resolved_ro:
+          raise RuntimeError("Unusable workspace mount")
+        return real_ntf(*args, **kwargs)
+
+      with mock.patch.object(
+          tempfile, "NamedTemporaryFile", side_effect=fake_ntf_second_writable
+      ):
+        path2, _, _ = agent._materialize_workflow_function(
+            ro_wf, [ws_ro, ws_rw], "desc"
+        )
+      try:
+        self.assertTrue(path2.startswith(resolved_rw))
+        self.assertTrue(os.path.isfile(path2))
+      finally:
+        if os.path.exists(path2):
+          os.unlink(path2)
+
+    # Also verify partial temp file cleanup when write() fails after file
+    # creation.
+    with (
+        tempfile.TemporaryDirectory() as ws_full,
+        tempfile.TemporaryDirectory() as ws_ok,
+    ):
+      resolved_full = str(pathlib.Path(ws_full).resolve())
+      resolved_ok = str(pathlib.Path(ws_ok).resolve())
+      leaked_paths = []
+
+      def fake_ntf_write_error(*args, **kwargs):
+        f = real_ntf(*args, **kwargs)
+        if kwargs.get("dir") == resolved_full:
+          leaked_paths.append(f.name)
+          f.write = mock.MagicMock(
+              side_effect=OSError(errno.ENOSPC, "No space left on device")
+          )
+        return f
+
+      with mock.patch.object(
+          tempfile, "NamedTemporaryFile", side_effect=fake_ntf_write_error
+      ):
+        path3, _, _ = agent._materialize_workflow_function(
+            ro_wf, [ws_full, ws_ok], "desc"
+        )
+      try:
+        self.assertEqual(len(leaked_paths), 1)
+        self.assertFalse(os.path.exists(leaked_paths[0]))
+        self.assertTrue(path3.startswith(resolved_ok))
+        self.assertTrue(os.path.isfile(path3))
+      finally:
+        if os.path.exists(path3):
+          os.unlink(path3)
+
+  def test_resolve_workflow_script_path_skips_inaccessible_workspaces(self):
+    with tempfile.TemporaryDirectory() as ws_dir:
+      script_file = pathlib.Path(ws_dir) / "wf.py"
+      script_file.write_text("phase('Run')\n", encoding="utf-8")
+      resolved, desc = agent._resolve_workflow_script_path(
+          "wf.py",
+          ["\x00invalid_ws", "/nonexistent/unmounted/workspace", ws_dir],
+          "",
+      )
+      self.assertEqual(resolved, str(script_file.resolve()))
+      self.assertEqual(desc, "Run workflow wf.py")
+
+      with self.assertRaises(FileNotFoundError):
+        agent._resolve_workflow_script_path(
+            "\x00invalid_script.py", [ws_dir], ""
+        )
+
+    for bad_source in ("phase('a')\x00", "break\n"):
+      with self.assertRaisesRegex(
+          workflows.WorkflowError, "workflow syntax error"
+      ):
+        workflows.validate_workflow_source(bad_source)
+
+    with mock.patch.object(
+        workflows.inspect, "getsource", side_effect=OSError("no source")
+    ):
+      with self.assertRaisesRegex(
+          workflows.WorkflowError, "cannot inspect source of workflow function"
+      ):
+        workflows.extract_workflow_source(lambda: None)
+
+    with mock.patch.object(
+        workflows.inspect, "getsource", return_value="def wf():\n  \x00\n"
+    ):
+      with self.assertRaisesRegex(
+          workflows.WorkflowError, "workflow syntax error"
+      ):
+        workflows.extract_workflow_source(lambda: None)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@
 """Event processor for localharness events."""
 
 import asyncio
+from collections import abc
 import dataclasses
 import json
 import logging
@@ -25,12 +26,12 @@ import pydantic
 
 from google.antigravity.proto import localharness_pb2
 from google.antigravity import types
-from google.antigravity.connections.local import struct_converter
+from google.antigravity.connections import struct_converter
 from google.antigravity.connections.local import types as local_types
 from google.antigravity.connections.local.hook_router import HookRouter
-from google.antigravity.connections.local.local_connection_config import BUILTIN_TOOL_PROTO_FIELDS
 from google.antigravity.connections.local.local_connection_config import make_step_id
 from google.antigravity.connections.local.local_connection_config import normalize_wire_path
+from google.antigravity.connections.local.local_connection_config import PROTO_FIELD_TO_SDK_NAME
 from google.antigravity.connections.local.local_connection_config import WIRE_PATH_ARGUMENT_KEYS
 from google.antigravity.connections.local.proto_converters import _parse_stop_reason
 from google.antigravity.hooks import hook_runner as h_runner
@@ -105,6 +106,50 @@ def _extract_media_from_result(value: Any) -> tuple[Any, list[Any]]:
         cleaned_dict[key] = cleaned_item
     return (cleaned_dict or None), dict_media
   return value, []
+
+
+def has_proto_extensions(obj: Any) -> bool:
+  """Checks whether `obj` or its descendants contain genai Content protos.
+
+  SDK media primitives (`_MEDIA_TYPES`) are intentionally excluded here so
+  `LocalConnection` continues routing pure SDK media return values through
+  `ToolResponse.supplemental_media`.
+
+  Args:
+    obj: The Python object or data structure to inspect.
+
+  Returns:
+    True if `obj` or any nested value is a `genai.Content` or media `Content`
+    proto message, otherwise False.
+  """
+  if struct_converter.is_content_proto(obj):
+    return True
+  if isinstance(obj, _MEDIA_TYPES) or isinstance(obj, type):
+    return False
+  if isinstance(obj, pydantic.RootModel):
+    return has_proto_extensions(obj.root)
+  if isinstance(obj, pydantic.BaseModel):
+    model_cls = type(obj)
+    for name, info in model_cls.model_fields.items():
+      if not info.exclude and has_proto_extensions(getattr(obj, name)):
+        return True
+    for name, info in model_cls.model_computed_fields.items():
+      if not getattr(info, "exclude", False) and has_proto_extensions(
+          getattr(obj, name)
+      ):
+        return True
+    extra = getattr(obj, "__pydantic_extra__", None) or {}
+    return any(has_proto_extensions(v) for v in extra.values())
+  if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+    return any(
+        has_proto_extensions(getattr(obj, f.name))
+        for f in dataclasses.fields(obj)
+    )
+  if isinstance(obj, abc.Mapping):
+    return any(has_proto_extensions(v) for v in obj.values())
+  if isinstance(obj, abc.Sequence) and not isinstance(obj, (str, bytes)):
+    return any(has_proto_extensions(v) for v in obj)
+  return False
 
 
 class _StepTracker:
@@ -328,11 +373,11 @@ class LocalConnectionStep(types.Step):
 
     tool_calls = []
 
-    # Find the active built-in tool enum and field name, if any.
+    # Find the active built-in/harness tool name and field payload, if any.
     active_tool_pair = next(
         (
-            (tool_enum.value, step_dict[proto_field])
-            for tool_enum, proto_field in BUILTIN_TOOL_PROTO_FIELDS.items()
+            (sdk_name, step_dict[proto_field])
+            for proto_field, sdk_name in PROTO_FIELD_TO_SDK_NAME.items()
             if proto_field in step_dict
         ),
         (None, {}),
@@ -397,9 +442,7 @@ class LocalConnectionStep(types.Step):
       step_type = types.StepType.COMPACTION
     elif step_dict.get("finish") is not None:
       step_type = types.StepType.FINISH
-    elif active_tool_name or any(
-        step_dict.get(k) is not None for k in BUILTIN_TOOL_PROTO_FIELDS.values()
-    ):
+    elif active_tool_name:
       step_type = types.StepType.TOOL_CALL
     elif step_dict.get("text"):
       step_type = types.StepType.TEXT_RESPONSE
@@ -1120,6 +1163,20 @@ class LocalHarnessEventProcessor(BaseLocalEventProcessor):
 
       result = await self._execute_client_tool(tc)
       if result is not None:
+        # The harness's terminal step for this call has its tool_calls
+        # stripped (see _emit_step), so close the call here.
+        done_step = tool_call_step.model_copy()
+        done_step.status = types.StepStatus.DONE
+        if result.error is not None:
+          done_step.status = types.StepStatus.ERROR
+          done_step.error = result.error
+        elif result.result is not None:
+          # As for the model: media split out, non-strings JSON-encoded.
+          value, _ = _extract_media_from_result(result.result)
+          if not isinstance(value, str) and value is not None:
+            value = _ANY_ADAPTER.dump_json(value, fallback=str).decode()
+          done_step.content = value or ""
+        await self.step_queue.put(done_step)
         await self._send_tool_results([result])
     except Exception as e:  # pylint: disable=broad-except
       logging.exception("_handle_tool_call failed; returning error to model")
@@ -1146,7 +1203,7 @@ class LocalHarnessEventProcessor(BaseLocalEventProcessor):
             error_message=result.error,
         )
       else:
-        if struct_converter.has_proto_extensions(result.result):
+        if has_proto_extensions(result.result):
           res_data = (
               result.result
               if struct_converter.is_structured(result.result)
@@ -1156,7 +1213,8 @@ class LocalHarnessEventProcessor(BaseLocalEventProcessor):
               id=result.id,
               response=struct_converter.to_struct(res_data),
               response_json=json.dumps(
-                  struct_converter.to_json_fallback(res_data)
+                  struct_converter.to_json_fallback(res_data),
+                  ensure_ascii=False,
               ),
           )
         else:
@@ -1173,7 +1231,7 @@ class LocalHarnessEventProcessor(BaseLocalEventProcessor):
           response = localharness_pb2.ToolResponse(
               id=result.id,
               response_json=json.dumps(
-                  self.tool_result_to_dict(result_for_json)
+                  self.tool_result_to_dict(result_for_json), ensure_ascii=False
               ),
               supplemental_media=[
                   localharness_pb2.Media(

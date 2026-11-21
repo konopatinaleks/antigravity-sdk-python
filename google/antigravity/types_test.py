@@ -492,6 +492,7 @@ class ThinkingLevelTest(unittest.TestCase):
     self.assertEqual(types.ThinkingLevel.LOW, "low")
     self.assertEqual(types.ThinkingLevel.MEDIUM, "medium")
     self.assertEqual(types.ThinkingLevel.HIGH, "high")
+    self.assertEqual(types.ThinkingLevel.EXTRA_HIGH, "xhigh")
 
   def test_string_comparison(self):
     """Verifies ThinkingLevel members compare equal to their string values."""
@@ -519,6 +520,17 @@ class ModelTargetTest(unittest.TestCase):
     self.assertEqual(
         mc.endpoint.options.thinking_level, types.ThinkingLevel.HIGH
     )
+    self.assertIsNone(mc.endpoint.options.max_output_tokens)
+
+  def test_gemini_model_options_max_output_tokens(self):
+    options = types.GeminiModelOptions(max_output_tokens=262144)
+    self.assertEqual(options.max_output_tokens, 262144)
+    with self.assertRaises(pydantic.ValidationError):
+      types.GeminiModelOptions(max_output_tokens=0)
+    with self.assertRaises(pydantic.ValidationError):
+      types.GeminiModelOptions(max_output_tokens=-1)
+    with self.assertRaises(pydantic.ValidationError):
+      types.GeminiModelOptions(max_output_tokens=2**31)
 
   def test_vertex_endpoint_construction(self):
     endpoint = types.VertexEndpoint(project="my-proj", location="us-east1")
@@ -546,6 +558,10 @@ class SystemInstructionsTest(unittest.TestCase):
     """Verifies construction of CustomSystemInstructions."""
     si = types.CustomSystemInstructions(text="Override all defaults.")
     self.assertEqual(si.text, "Override all defaults.")
+    self.assertIsNone(si.title)
+
+    si2 = types.CustomSystemInstructions(text="With title", title="my_title")
+    self.assertEqual(si2.title, "my_title")
 
   def test_templated_construction(self):
     """Verifies construction of TemplatedSystemInstructions."""
@@ -619,7 +635,11 @@ class BuiltinToolsTest(parameterized.TestCase):
           types.BuiltinTools.READ_URL_CONTENT,
           "read_url_content",
       ),
-      ("start_subagent", types.BuiltinTools.START_SUBAGENT, "start_subagent"),
+      (
+          "invoke_subagent",
+          types.BuiltinTools.INVOKE_SUBAGENT,
+          "invoke_subagent",
+      ),
       ("run_workflow", types.BuiltinTools.RUN_WORKFLOW, "run_workflow"),
       ("generate_image", types.BuiltinTools.GENERATE_IMAGE, "generate_image"),
       ("schedule", types.BuiltinTools.SCHEDULE, "schedule"),
@@ -654,7 +674,7 @@ class BuiltinToolsTest(parameterized.TestCase):
         types.BuiltinTools.EDIT_FILE,
         types.BuiltinTools.RUN_COMMAND,
         types.BuiltinTools.ASK_QUESTION,
-        types.BuiltinTools.START_SUBAGENT,
+        types.BuiltinTools.INVOKE_SUBAGENT,
         types.BuiltinTools.RUN_WORKFLOW,
         types.BuiltinTools.GENERATE_IMAGE,
         types.BuiltinTools.SEARCH_WEB,
@@ -673,6 +693,61 @@ class BuiltinToolsTest(parameterized.TestCase):
         read_only & write_tools,
         "read_only and write_tools must not overlap.",
     )
+
+  def test_start_subagent_alias_and_string_coercion(self):
+    """Verifies START_SUBAGENT alias, deprecation warning, and coercion."""
+    with self.assertWarns(DeprecationWarning):
+      alias = types.BuiltinTools.START_SUBAGENT
+    self.assertIs(alias, types.BuiltinTools.INVOKE_SUBAGENT)
+    self.assertIs(
+        types.BuiltinTools["START_SUBAGENT"], types.BuiltinTools.INVOKE_SUBAGENT
+    )
+    self.assertEqual(
+        types.BuiltinTools.INVOKE_SUBAGENT.value, "invoke_subagent"
+    )
+    self.assertEqual(str(types.BuiltinTools.INVOKE_SUBAGENT), "invoke_subagent")
+    self.assertEqual(alias.value, "invoke_subagent")
+    with self.assertWarns(DeprecationWarning):
+      coerced = types.BuiltinTools("start_subagent")
+    self.assertIs(coerced, types.BuiltinTools.INVOKE_SUBAGENT)
+    with self.assertRaises(ValueError):
+      types.BuiltinTools("unknown_tool")
+    with self.assertWarns(DeprecationWarning):
+      cfg = types.CapabilitiesConfig(
+          enabled_tools=["start_subagent"],
+      )
+    self.assertEqual(cfg.enabled_tools, [types.BuiltinTools.INVOKE_SUBAGENT])
+    with self.assertWarns(DeprecationWarning):
+      cfg_disabled = types.CapabilitiesConfig(
+          disabled_tools=["start_subagent"],
+      )
+    self.assertEqual(
+        cfg_disabled.disabled_tools, [types.BuiltinTools.INVOKE_SUBAGENT]
+    )
+    tc = types.ToolCall(name="start_subagent", args={"TypeName": "helper"})
+    self.assertEqual(tc.name, types.BuiltinTools.INVOKE_SUBAGENT)
+    self.assertIs(type(tc.name), str)
+    tc_mcp = types.ToolCall(
+        name="start_subagent", server_name="mcp", args={"TypeName": "helper"}
+    )
+    self.assertEqual(tc_mcp.name, "start_subagent")
+    tr = types.ToolResult(name="start_subagent", result="ok")
+    self.assertEqual(tr.name, types.BuiltinTools.INVOKE_SUBAGENT)
+    self.assertIs(type(tr.name), str)
+    tr_mcp = types.ToolResult(
+        name="start_subagent", server_name="mcp", result="ok"
+    )
+    self.assertEqual(tr_mcp.name, "start_subagent")
+    mock_tc = mock.MagicMock(spec=types.ToolCall)
+    mock_tc.name = "finish"
+    mock_tc.args = None
+    mock_tr = mock.MagicMock(spec=types.ToolResult)
+    mock_tr.name = "finish"
+    step = types.Step(
+        step_index=1, tool_calls=[mock_tc], tool_results=[mock_tr]
+    )
+    self.assertEqual(step.tool_calls[0].name, "finish")
+    self.assertEqual(step.tool_results[0].name, "finish")
 
   def test_nondestructive_covers_all_tools(self):
     """Verifies nondestructive + deprecated + destructive tools = full enum.
@@ -762,6 +837,16 @@ class CapabilitiesConfigTest(unittest.TestCase):
     self.assertIsNone(config.disabled_tools)
     self.assertIsNone(config.compaction_threshold)
     self.assertIsNone(config.finish_tool_schema_json)
+    self.assertIsNone(config.mcp_max_output_bytes)
+
+  def test_mcp_max_output_bytes(self):
+    """Verifies that mcp_max_output_bytes accepts positive int32 values and rejects invalid values."""
+    config = types.CapabilitiesConfig(mcp_max_output_bytes=65536)
+    self.assertEqual(config.mcp_max_output_bytes, 65536)
+    for invalid_bytes in (0, -1, 2**31):
+      with self.subTest(invalid_bytes=invalid_bytes):
+        with self.assertRaises(pydantic.ValidationError):
+          types.CapabilitiesConfig(mcp_max_output_bytes=invalid_bytes)
 
   def test_agent_behavior_explicit(self):
     """Verifies that agent_behavior can be explicitly set via enum or string."""
@@ -947,34 +1032,34 @@ class CapabilitiesConfigTest(unittest.TestCase):
       )
     self.assertIn("allowed_subagents cannot be specified", str(cm.exception))
 
-  def test_max_subagent_depth_fails_when_start_subagent_tool_disabled(self):
-    """Verifies ValidationError when START_SUBAGENT and RUN_WORKFLOW are in disabled_tools."""
+  def test_max_subagent_depth_fails_when_invoke_subagent_tool_disabled(self):
+    """Verifies ValidationError when INVOKE_SUBAGENT and RUN_WORKFLOW are in disabled_tools."""
     with self.assertRaises(pydantic.ValidationError) as cm:
       types.CapabilitiesConfig(
           disabled_tools=[
-              types.BuiltinTools.START_SUBAGENT,
+              types.BuiltinTools.INVOKE_SUBAGENT,
               types.BuiltinTools.RUN_WORKFLOW,
           ],
           max_subagent_depth=3,
       )
     self.assertIn("max_subagent_depth cannot be configured", str(cm.exception))
 
-  def test_allowed_subagents_fails_when_start_subagent_tool_disabled(self):
-    """Verifies ValidationError when START_SUBAGENT and RUN_WORKFLOW are in disabled_tools and allowed_subagents is set."""
+  def test_allowed_subagents_fails_when_invoke_subagent_tool_disabled(self):
+    """Verifies ValidationError when INVOKE_SUBAGENT and RUN_WORKFLOW are in disabled_tools and allowed_subagents is set."""
     with self.assertRaises(pydantic.ValidationError) as cm:
       types.CapabilitiesConfig(
           disabled_tools=[
-              types.BuiltinTools.START_SUBAGENT,
+              types.BuiltinTools.INVOKE_SUBAGENT,
               types.BuiltinTools.RUN_WORKFLOW,
           ],
           allowed_subagents=["worker"],
       )
     self.assertIn("allowed_subagents cannot be specified", str(cm.exception))
 
-  def test_max_subagent_depth_fails_when_start_subagent_not_in_enabled_tools(
+  def test_max_subagent_depth_fails_when_invoke_subagent_not_in_enabled_tools(
       self,
   ):
-    """Verifies ValidationError when START_SUBAGENT is omitted from enabled_tools."""
+    """Verifies ValidationError when INVOKE_SUBAGENT is omitted from enabled_tools."""
     with self.assertRaises(pydantic.ValidationError) as cm:
       types.CapabilitiesConfig(
           enabled_tools=[types.BuiltinTools.VIEW_FILE],
@@ -982,10 +1067,10 @@ class CapabilitiesConfigTest(unittest.TestCase):
       )
     self.assertIn("max_subagent_depth cannot be configured", str(cm.exception))
 
-  def test_allowed_subagents_fails_when_start_subagent_not_in_enabled_tools(
+  def test_allowed_subagents_fails_when_invoke_subagent_not_in_enabled_tools(
       self,
   ):
-    """Verifies ValidationError when START_SUBAGENT is omitted from enabled_tools and allowed_subagents is set."""
+    """Verifies ValidationError when INVOKE_SUBAGENT is omitted from enabled_tools and allowed_subagents is set."""
     with self.assertRaises(pydantic.ValidationError) as cm:
       types.CapabilitiesConfig(
           enabled_tools=[types.BuiltinTools.VIEW_FILE],
@@ -1008,19 +1093,19 @@ class CapabilitiesConfigTest(unittest.TestCase):
     )
     self.assertEqual(sub_caps.allowed_subagents, ["worker"])
 
-  def test_disabling_only_start_subagent_permits_subagent_options_for_run_workflow(
+  def test_disabling_only_invoke_subagent_permits_subagent_options_for_run_workflow(
       self,
   ):
-    """Verifies disabling START_SUBAGENT while leaving RUN_WORKFLOW enabled permits subagent options."""
+    """Verifies disabling INVOKE_SUBAGENT while leaving RUN_WORKFLOW enabled permits subagent options."""
     cfg = types.CapabilitiesConfig(
-        disabled_tools=[types.BuiltinTools.START_SUBAGENT],
+        disabled_tools=[types.BuiltinTools.INVOKE_SUBAGENT],
         max_subagent_depth=2,
         allowed_subagents=["worker"],
     )
     self.assertEqual(cfg.max_subagent_depth, 2)
     self.assertEqual(cfg.allowed_subagents, ["worker"])
     sub_caps = types.SubagentCapabilities(
-        disabled_tools=[types.BuiltinTools.START_SUBAGENT],
+        disabled_tools=[types.BuiltinTools.INVOKE_SUBAGENT],
         allowed_subagents=["worker"],
     )
     self.assertEqual(sub_caps.allowed_subagents, ["worker"])
@@ -1214,6 +1299,18 @@ class ImageTest(unittest.TestCase):
       self.assertEqual(img.mime_type, "image/png")
       self.assertEqual(img.description, "profile photo")
 
+  def test_from_file_expands_user_tilde(self):
+    """Verifies that Image.from_file expands ~ to user home directory."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      test_file = pathlib.Path(tmpdir) / "photo.png"
+      test_file.write_bytes(b"png_file_content")
+      with mock.patch.object(
+          pathlib.Path, "expanduser", autospec=True, return_value=test_file
+      ):
+        img = types.Image.from_file("~/photo.png")
+        self.assertEqual(img.data, b"png_file_content")
+        self.assertEqual(img.mime_type, "image/png")
+
   def test_from_file_inference_failure_raises(self):
     """Verifies that from_file loader raises ValueError when extension is unknown."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1225,6 +1322,11 @@ class ImageTest(unittest.TestCase):
           ValueError, "Could not infer a valid MIME type"
       ):
         types.Image.from_file(tmp_file)
+
+  def test_case_insensitive_and_whitespace_normalization(self):
+    """Verifies that Image normalizes MIME type to lowercase and strips whitespace."""
+    img = types.Image(data=b"png_data", mime_type=" IMAGE/PNG\n ")
+    self.assertEqual(img.mime_type, "image/png")
 
 
 class DocumentTest(parameterized.TestCase):
@@ -1272,6 +1374,11 @@ class DocumentTest(parameterized.TestCase):
       self.assertEqual(doc.mime_type, "application/pdf")
       self.assertEqual(doc.description, "monthly report")
 
+  def test_case_insensitive_and_whitespace_normalization(self):
+    """Verifies that Document normalizes MIME type to lowercase and strips whitespace."""
+    doc = types.Document(data=b"pdf_data", mime_type=" Application/PDF ")
+    self.assertEqual(doc.mime_type, "application/pdf")
+
 
 class AudioTest(parameterized.TestCase):
   """Validates the Audio content attachment primitive and its validators."""
@@ -1308,6 +1415,11 @@ class AudioTest(parameterized.TestCase):
     with self.assertRaises(pydantic.ValidationError):
       types.Audio(data=b"wav_bytes", mime_type="audio/unsupported-wav")
 
+  def test_case_insensitive_and_whitespace_normalization(self):
+    """Verifies that Audio normalizes MIME type to lowercase and strips whitespace."""
+    audio = types.Audio(data=b"mp3_data", mime_type=" Audio/MPEG\t")
+    self.assertEqual(audio.mime_type, "audio/mpeg")
+
 
 class VideoTest(unittest.TestCase):
   """Validates the Video content attachment primitive and its validators."""
@@ -1322,6 +1434,11 @@ class VideoTest(unittest.TestCase):
     """Verifies that an unsupported Video MIME type triggers ValidationError."""
     with self.assertRaises(pydantic.ValidationError):
       types.Video(data=b"mov_bytes", mime_type="video/unsupported-mov")
+
+  def test_case_insensitive_and_whitespace_normalization(self):
+    """Verifies that Video normalizes MIME type to lowercase and strips whitespace."""
+    video = types.Video(data=b"mp4_data", mime_type=" VIDEO/MP4 ")
+    self.assertEqual(video.mime_type, "video/mp4")
 
 
 class ContentFromFileResolverTest(parameterized.TestCase):
@@ -1398,6 +1515,30 @@ class ContentFromFileResolverTest(parameterized.TestCase):
         with self.assertRaisesRegex(OSError, "Failed to read file"):
           types.from_file(tmp_file)
 
+  def test_from_file_expands_user_tilde(self):
+    """Verifies that from_file expands ~ to user home directory."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      test_file = pathlib.Path(tmpdir) / "doc.pdf"
+      test_file.write_bytes(b"%PDF-sample")
+      with mock.patch.object(
+          pathlib.Path, "expanduser", autospec=True, return_value=test_file
+      ):
+        doc = types.from_file("~/doc.pdf")
+        self.assertIsInstance(doc, types.Document)
+        self.assertEqual(doc.data, b"%PDF-sample")
+        self.assertEqual(doc.mime_type, "application/pdf")
+
+  def test_read_file_safely_expands_user_tilde(self):
+    """Verifies that _read_file_safely expands ~ to user home directory."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      test_file = pathlib.Path(tmpdir) / "raw.bin"
+      test_file.write_bytes(b"binary_content")
+      with mock.patch.object(
+          pathlib.Path, "expanduser", autospec=True, return_value=test_file
+      ):
+        data = types._read_file_safely("~/raw.bin")
+        self.assertEqual(data, b"binary_content")
+
 
 class ContentFromBytesResolverTest(parameterized.TestCase):
   """Validates the global from_bytes content resolver helper function."""
@@ -1422,6 +1563,16 @@ class ContentFromBytesResolverTest(parameterized.TestCase):
     """Verifies that an unsupported MIME type raises a descriptive ValueError."""
     with self.assertRaisesRegex(ValueError, "Unsupported MIME type"):
       types.from_bytes(b"data", mime_type="application/x-unsupported-custom")
+
+  def test_resolves_from_bytes_case_insensitive_and_whitespace(self):
+    """Verifies that from_bytes normalizes case-insensitive and padded MIME types."""
+    res_img = types.from_bytes(b"fake_bytes", mime_type=" IMAGE/PNG\n ")
+    self.assertIsInstance(res_img, types.Image)
+    self.assertEqual(res_img.mime_type, "image/png")
+
+    res_doc = types.from_bytes(b"fake_bytes", mime_type=" Application/PDF ")
+    self.assertIsInstance(res_doc, types.Document)
+    self.assertEqual(res_doc.mime_type, "application/pdf")
 
 
 class ChatResponseStreamTest(unittest.IsolatedAsyncioTestCase):
@@ -1944,6 +2095,190 @@ class ChatResponseStreamTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(wf_res.usage_metadata.total_token_count, 15)
     self.assertEqual(wf_res.stop_reason, types.StopReason.UNSPECIFIED)
 
+  async def test_structured_output_reraises_stream_error_on_repeat_calls(self):
+    """Verifies repeat structured_output() calls re-raise stored stream errors.
+
+    What: Exercises structured_output() after a stream fails on both initial
+      structured_output() calls and after an earlier text()/resolve() failure.
+    Why: Ensures a failed or cancelled stream never swallows _stream_error and
+      returns stale or empty structured output on subsequent calls.
+    How: Raises RuntimeError from mock streams and asserts repeat
+      structured_output() invocations consistently re-raise RuntimeError.
+    """
+
+    async def failing_stream():
+      yield types.Text(step_index=1, text="partial")
+      raise RuntimeError("stream interrupted")
+
+    mock_conv = mock.MagicMock(spec=conversation.Conversation)
+    mock_conv.get_last_structured_output.return_value = {"stale": True}
+    response = types.ChatResponse(failing_stream(), conversation=mock_conv)
+
+    with self.assertRaisesRegex(RuntimeError, "stream interrupted"):
+      await response.structured_output()
+
+    with self.assertRaisesRegex(RuntimeError, "stream interrupted"):
+      await response.structured_output()
+
+    mock_conv.get_last_structured_output.assert_not_called()
+
+    async def failing_stream_via_text():
+      yield types.Text(step_index=1, text="partial")
+      raise ValueError("broken payload")
+
+    response_after_text = types.ChatResponse(
+        failing_stream_via_text(), conversation=mock_conv
+    )
+    with self.assertRaisesRegex(ValueError, "broken payload"):
+      await response_after_text.text()
+
+    with self.assertRaisesRegex(ValueError, "broken payload"):
+      await response_after_text.structured_output()
+
+  async def test_stream_completion_and_error_snapshot_turn_metadata(self):
+    """Verifies completed and failed streams snapshot turn metadata once.
+
+    What: Tests metadata snapshotting on normal completion, cancellation,
+      exceptions, and conversation=None before conversation state changes.
+    Why: Ensures retained ChatResponse instances preserve their own turn's
+      structured_output(), usage_metadata, and stop_reason across later turns.
+    How: Resolves/fails streams, mutates mock_conv to Turn 2 values, and
+      asserts Turn 1's ChatResponse retains Turn 1 metadata and defensive
+      UsageMetadata copies.
+    """
+
+    async def ok_stream():
+      yield types.Text(step_index=1, text="turn 1")
+
+    mock_conv = mock.MagicMock(spec=conversation.Conversation)
+    mock_conv.get_last_structured_output.return_value = {"turn": 1}
+    mock_conv.last_turn_usage = types.UsageMetadata(
+        prompt_token_count=40,
+        candidates_token_count=10,
+        total_token_count=50,
+    )
+    mock_conv._last_turn_stop_reason = types.StopReason.MAX_MODEL_CALLS_EXCEEDED
+    resp_ok = types.ChatResponse(ok_stream(), conversation=mock_conv)
+    self.assertEqual(await resp_ok.text(), "turn 1")
+
+    # Mutate conversation to simulate Turn 2 overwriting live properties.
+    mock_conv.get_last_structured_output.return_value = {"turn": 2}
+    mock_conv.last_turn_usage = types.UsageMetadata(
+        prompt_token_count=900,
+        candidates_token_count=99,
+        total_token_count=999,
+    )
+    mock_conv._last_turn_stop_reason = types.StopReason.UNSPECIFIED
+
+    self.assertEqual(await resp_ok.structured_output(), {"turn": 1})
+    usage = resp_ok.usage_metadata
+    self.assertIsNotNone(usage)
+    self.assertEqual(usage.total_token_count, 50)
+    usage.prompt_token_count = 12345
+    self.assertEqual(resp_ok.usage_metadata.prompt_token_count, 40)
+    self.assertEqual(
+        resp_ok.stop_reason, types.StopReason.MAX_MODEL_CALLS_EXCEEDED
+    )
+
+    for name, raised_exc in (
+        ("cancelled", types.AntigravityCancelledError("aborted")),
+        ("runtime_error", RuntimeError("backend failure")),
+    ):
+      with self.subTest(name):
+
+        async def interrupted_stream(exc=raised_exc):
+          yield types.Text(step_index=1, text="partial")
+          raise exc
+
+        err_conv = mock.MagicMock(spec=conversation.Conversation)
+        err_conv.last_turn_usage = types.UsageMetadata(
+            prompt_token_count=15, total_token_count=15
+        )
+        err_conv._last_turn_stop_reason = types.StopReason.QUOTA_EXHAUSTED
+        resp_err = types.ChatResponse(
+            interrupted_stream(), conversation=err_conv
+        )
+
+        with self.assertRaises(type(raised_exc)):
+          await resp_err.resolve()
+
+        err_conv.last_turn_usage = types.UsageMetadata(
+            prompt_token_count=500, total_token_count=500
+        )
+        err_conv._last_turn_stop_reason = types.StopReason.UNSPECIFIED
+
+        self.assertEqual(resp_err.usage_metadata.total_token_count, 15)
+        self.assertEqual(resp_err.stop_reason, types.StopReason.QUOTA_EXHAUSTED)
+        with self.assertRaises(type(raised_exc)):
+          await resp_err.structured_output()
+
+    async def standalone_stream():
+      yield types.Text(step_index=0, text="standalone")
+
+    standalone = types.ChatResponse(standalone_stream(), conversation=None)
+    self.assertIsNone(standalone.usage_metadata)
+    self.assertEqual(standalone.stop_reason, types.StopReason.UNSPECIFIED)
+    await standalone.cancel()
+    self.assertEqual(await standalone.text(), "standalone")
+    self.assertIsNone(await standalone.structured_output())
+
+  async def test_workflow_result_preserves_turn_metadata_across_turns(self):
+    """Verifies WorkflowResult snapshots turn metadata independently of later turns.
+
+    What: Tests WorkflowResult(chunk_stream=None) and _from_chat_response() for
+      both resolved and unresolved ChatResponse instances before mutating
+      conversation state.
+    Why: Ensures WorkflowResult inherits full multi-turn ChatResponse isolation
+      and carries over all ChatResponse state automatically.
+    How: Constructs WorkflowResult variants, mutates conversation state, and
+      asserts structured_output(), usage_metadata, and stop_reason hold.
+    """
+    mock_conv = mock.MagicMock(spec=conversation.Conversation)
+    mock_conv.get_last_structured_output.return_value = {"wf": 1}
+    mock_conv.last_turn_usage = types.UsageMetadata(
+        prompt_token_count=30, candidates_token_count=10, total_token_count=40
+    )
+    mock_conv._last_turn_stop_reason = types.StopReason.MAX_TOOL_CALLS_EXCEEDED
+
+    direct_wf = types.WorkflowResult(
+        conversation=mock_conv,
+        script_path="/tmp/wf1.py",
+        response_text="Workflow 1 done.",
+    )
+
+    async def resolved_stream():
+      yield types.Text(step_index=1, text="Workflow 1 stream.")
+
+    chat_resp = types.ChatResponse(resolved_stream(), conversation=mock_conv)
+    text = await chat_resp.text()
+    from_resolved = types.WorkflowResult._from_chat_response(  # pylint: disable=protected-access
+        chat_resp,
+        script_path="/tmp/wf1.py",
+        response_text=text,
+    )
+
+    async def pending_stream():
+      yield types.Text(step_index=1, text="Workflow pending.")
+
+    pending_chat = types.ChatResponse(pending_stream(), conversation=mock_conv)
+    from_pending = types.WorkflowResult._from_chat_response(  # pylint: disable=protected-access
+        pending_chat,
+        script_path="/tmp/pending.py",
+    )
+    self.assertEqual(await from_pending.text(), "Workflow pending.")
+
+    # Simulate Turn 2 overwriting all live conversation properties.
+    mock_conv.get_last_structured_output.return_value = {"wf": 2}
+    mock_conv.last_turn_usage = types.UsageMetadata(
+        prompt_token_count=200, candidates_token_count=50, total_token_count=250
+    )
+    mock_conv._last_turn_stop_reason = types.StopReason.UNSPECIFIED
+
+    for wf in (direct_wf, from_resolved, from_pending):
+      self.assertEqual(await wf.structured_output(), {"wf": 1})
+      self.assertEqual(wf.usage_metadata.total_token_count, 40)
+      self.assertEqual(wf.stop_reason, types.StopReason.MAX_TOOL_CALLS_EXCEEDED)
+
 
 class McpServerConfigTest(parameterized.TestCase):
   """Validates the McpServerConfig Pydantic models and required fields."""
@@ -2216,31 +2551,33 @@ class SubagentCapabilitiesTest(unittest.TestCase):
           disabled_tools=[types.BuiltinTools.RUN_COMMAND],
       )
 
-  def test_allowed_subagents_valid_when_start_subagent_enabled(self):
+  def test_allowed_subagents_valid_when_invoke_subagent_enabled(self):
     sc = types.SubagentCapabilities(
-        enabled_tools=[types.BuiltinTools.START_SUBAGENT],
+        enabled_tools=[types.BuiltinTools.INVOKE_SUBAGENT],
         allowed_subagents=["worker"],
     )
     self.assertEqual(sc.allowed_subagents, ["worker"])
 
-  def test_allowed_subagents_raises_when_start_subagent_omitted_from_enabled_tools(
+  def test_allowed_subagents_raises_when_invoke_subagent_omitted_from_enabled_tools(
       self,
   ):
     with self.assertRaisesRegex(
-        pydantic.ValidationError, "START_SUBAGENT is disabled or omitted"
+        pydantic.ValidationError, "INVOKE_SUBAGENT is disabled or omitted"
     ):
       types.SubagentCapabilities(
           enabled_tools=[types.BuiltinTools.VIEW_FILE],
           allowed_subagents=["worker"],
       )
 
-  def test_allowed_subagents_raises_when_start_subagent_in_disabled_tools(self):
+  def test_allowed_subagents_raises_when_invoke_subagent_in_disabled_tools(
+      self,
+  ):
     with self.assertRaisesRegex(
-        pydantic.ValidationError, "START_SUBAGENT is disabled or omitted"
+        pydantic.ValidationError, "INVOKE_SUBAGENT is disabled or omitted"
     ):
       types.SubagentCapabilities(
           disabled_tools=[
-              types.BuiltinTools.START_SUBAGENT,
+              types.BuiltinTools.INVOKE_SUBAGENT,
               types.BuiltinTools.RUN_WORKFLOW,
           ],
           allowed_subagents=["worker"],
